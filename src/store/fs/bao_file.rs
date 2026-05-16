@@ -747,3 +747,121 @@ impl BaoFileStorageSubscriber {
         }
     }
 }
+
+#[cfg(test)]
+mod persist_regression {
+    //! Regression coverage for the uniclipboard patch to `HashContext::persist()`
+    //! in `super::super::fs.rs`.
+    //!
+    //! Upstream `persist()` is invoked by the entity-manager via `on_shutdown`
+    //! (drop / soft shutdown / idle evict). Its body is:
+    //!
+    //! ```ignore
+    //! let BaoFileStorage::Partial(fs) = guard.take() else {
+    //!     return false;
+    //! };
+    //! ```
+    //!
+    //! `guard.take()` is `mem::replace(self, BaoFileStorage::Poisoned)` — it
+    //! *unconditionally* swaps the state with `Poisoned` and returns the old
+    //! value. The let-else branch then early-returns without restoring the
+    //! original state, so any handle that was `Complete`, `NonExisting`, etc.
+    //! is permanently poisoned, even though no real I/O error occurred.
+    //!
+    //! A later `observe(hash)` reaches `BaoFileStorageSubscriber::forward`,
+    //! which calls `BaoFileStorage::bitfield()`. The `Poisoned` arm in
+    //! `bitfield()` panics with `"poisoned storage should not be used"`,
+    //! taking down the entity-manager actor task.
+    //!
+    //! The patched `persist()` matches on the variant *before* calling
+    //! `take()`, so non-`Partial` states stay intact.
+
+    use bytes::Bytes;
+    use tokio::sync::watch;
+
+    use super::{BaoFileStorage, CompleteStorage, MemOrFile};
+
+    fn complete_state() -> BaoFileStorage {
+        BaoFileStorage::Complete(CompleteStorage {
+            data: MemOrFile::Mem(Bytes::from_static(&[1, 2, 3, 4])),
+            outboard: MemOrFile::empty(),
+        })
+    }
+
+    /// Patched `persist()` logic: matches on `Partial` before taking, so
+    /// non-`Partial` states stay intact and `bitfield()` remains callable.
+    #[test]
+    fn patched_persist_leaves_complete_state_intact() {
+        let (tx, _rx) = watch::channel(complete_state());
+
+        tx.send_if_modified(|guard| {
+            // Mirror of the patched body in fs.rs::HashContext::persist().
+            if !matches!(&*guard, BaoFileStorage::Partial(_)) {
+                return false;
+            }
+            let BaoFileStorage::Partial(_fs) = guard.take() else {
+                unreachable!("variant checked above");
+            };
+            false
+        });
+
+        let guard = tx.borrow();
+        assert!(
+            matches!(&*guard, BaoFileStorage::Complete(_)),
+            "patched persist must leave Complete state intact; observed {:?}",
+            *guard,
+        );
+
+        // The original failure mode is `bitfield()` panicking; we exercise
+        // it explicitly so the test fails loudly if the invariant breaks.
+        let _ = guard.bitfield();
+    }
+
+    /// Documents the upstream bug: the unconditional `guard.take()` path
+    /// leaves the state `Poisoned`, and the next `bitfield()` panics.
+    ///
+    /// Marked `#[should_panic]` so the test passes today (against the buggy
+    /// snippet) and will start failing if upstream changes either the panic
+    /// message or the `Poisoned` semantics — at which point this vendor
+    /// patch can likely be retired.
+    #[test]
+    #[should_panic(expected = "poisoned storage should not be used")]
+    fn upstream_buggy_persist_poisons_complete_state() {
+        let (tx, _rx) = watch::channel(complete_state());
+
+        // Mirror of the *unpatched* upstream body.
+        tx.send_if_modified(|guard| {
+            let BaoFileStorage::Partial(_fs) = guard.take() else {
+                return false;
+            };
+            false
+        });
+
+        // State is now `Poisoned` — bitfield() must panic.
+        let guard = tx.borrow();
+        let _ = guard.bitfield();
+    }
+
+    // Note: a fully deterministic concurrent reproduction at this layer is
+    // surprisingly tricky:
+    //
+    //   * Upstream's buggy `persist()` calls `send_if_modified(|_| ... false)`.
+    //     `tokio::sync::watch` only fires `changed()` when the closure
+    //     returns `true`, so a subscriber parked on `changed()` never wakes
+    //     up after the buggy take()-to-Poisoned, even though the inner
+    //     value is now Poisoned.
+    //   * Through the public `FsStore` API the production race window is
+    //     covered up by the entity-manager: after `on_shutdown -> persist`
+    //     poisons the state, the main actor either `reset()`s the state
+    //     when the inbox is non-empty (re-loading from DB) or recycles
+    //     the actor into the pool with a `reset()` before reuse. So the
+    //     deterministic public-API repro would need a precise race on
+    //     `ShutdownComplete` processing that this unit test layer cannot
+    //     stage reliably.
+    //
+    // The two snippet tests above cover the actual fix surface — the
+    // patched body keeps non-Partial states intact, and the buggy body
+    // poisons them so the next `bitfield()` panics. The end-to-end
+    // happy path through `FsStore` is exercised by
+    // `store::fs::tests::try_reference_then_re_observe_smoke`.
+}

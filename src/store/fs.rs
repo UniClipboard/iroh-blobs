@@ -296,7 +296,7 @@ impl SyncEntityApi for HashContext {
                     match self.global.db.get(self.id).await {
                         Ok(state) => match BaoFileStorage::open(state, self).await {
                             Ok(handle) => handle,
-                            Err(_) => BaoFileStorage::Poisoned,
+                            Err(cause) => state_from_open_error(cause),
                         },
                         Err(_) => BaoFileStorage::Poisoned,
                     }
@@ -375,6 +375,38 @@ impl SyncEntityApi for HashContext {
             BaoFileStorage::Loading => Err(io::Error::other("loading")),
             BaoFileStorage::NonExisting => Err(io::ErrorKind::NotFound.into()),
         }
+    }
+}
+
+/// Map a `BaoFileStorage::open` failure to the in-memory state we should
+/// install while loading the hash.
+///
+/// uniclipboard patch (companion to the `persist()` fix in this same file):
+/// upstream unconditionally falls back to `BaoFileStorage::Poisoned` for
+/// every IO error. That hides the difference between
+///
+/// 1. **The metadata DB says `Complete{External(path)}` but the path was
+///    deleted out from under us** (typical when an older cleanup pass
+///    `tokio::fs::remove_file`-d a cache file without telling iroh-blobs).
+///    The blob is recoverable — we just need to re-fetch from the
+///    network. Poisoning the handle here turns the next `observe(hash)`
+///    into a process-fatal panic (`bao_file.rs:410`).
+/// 2. **A real IO failure** (disk full, permission denied, corrupted
+///    metadata) where surfacing the broken state is the right call.
+///
+/// We special-case the first by inspecting `ErrorKind::NotFound` and
+/// returning `NonExisting`, which causes `bitfield()` to yield an empty
+/// bitfield rather than panicking. Downstream code then sees "the blob
+/// isn't here" and goes through the normal `download → ImportBao` path,
+/// which rewrites the metadata entry to whatever the new fetch produces.
+///
+/// All other IO error kinds keep the upstream `Poisoned` behaviour, so
+/// genuine on-disk corruption still bubbles up loudly.
+fn state_from_open_error(cause: io::Error) -> BaoFileStorage {
+    if cause.kind() == io::ErrorKind::NotFound {
+        BaoFileStorage::NonExisting
+    } else {
+        BaoFileStorage::Poisoned
     }
 }
 
@@ -991,8 +1023,20 @@ impl EntityApi for HashContext {
     async fn persist(&self) {
         self.state.send_if_modified(|guard| {
             let hash = &self.id;
-            let BaoFileStorage::Partial(fs) = guard.take() else {
+            // uniclipboard patch: `guard.take()` unconditionally swaps the
+            // current state to `Poisoned`. Upstream's `let-else` discards
+            // the taken value when the state is not `Partial`, permanently
+            // leaving the handle poisoned even though no actual error
+            // occurred. A subsequent `observe(hash)` then hits
+            // `BaoFileStorage::bitfield()`'s panic arm.
+            //
+            // Check the variant before taking so non-`Partial` states stay
+            // intact. Behaviour for `Partial` is unchanged.
+            if !matches!(&*guard, BaoFileStorage::Partial(_)) {
                 return false;
+            }
+            let BaoFileStorage::Partial(fs) = guard.take() else {
+                unreachable!("variant checked above");
             };
             let path = self.global.options.path.bitfield_path(hash);
             trace!("writing bitfield for hash {} to {}", hash, path.display());
@@ -1718,6 +1762,85 @@ pub mod tests {
         Ok(())
     }
 
+    // End-to-end smoke test for the uniclipboard `persist()` patch (see
+    // `vendor/iroh-blobs/UNICLIPBOARD_PATCH.md` for the full upstream
+    // trigger). Exercises the full public-API receiver-side sequence:
+    //
+    //   1. add the blob (state: Complete(Owned))
+    //   2. export with TryReference — metadata DB switches to
+    //      Complete(External), owned data file is renamed to the target
+    //   3. give the entity_manager a chance to run `on_shutdown` (which
+    //      invokes `persist()` on the in-memory handle)
+    //   4. observe the same hash again
+    //
+    // Under upstream-buggy `persist()`, step 3 takes the Complete state to
+    // Poisoned without restoring it; step 4 then dispatches
+    // `forward() → bitfield()` and hits the Poisoned panic arm. The
+    // uniclipboard patch makes step 3 a no-op for non-Partial states.
+    //
+    // Note: step 3 is racy by nature — actor idle-shutdown timing depends
+    // on tokio scheduling. This is a smoke test exercising the
+    // application-level path; it cannot reliably reproduce the panic on
+    // its own. The deterministic coverage of the bug lives in
+    // `store::fs::bao_file::persist_regression` (which mirrors both the
+    // buggy and the patched `persist()` snippets in isolation).
+    #[tokio::test]
+    async fn try_reference_then_re_observe_smoke() -> TestResult<()> {
+        use crate::api::blobs::{ExportMode, ExportOptions};
+
+        tracing_subscriber::fmt::try_init().ok();
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let store = FsStore::load(db_dir).await?;
+
+        // Run the import → TryReference → re-observe sequence many times
+        // against distinct hashes so the entity_manager actor pool churns
+        // (default pool_capacity=10). With each iteration the previous
+        // hash's actor has a chance to be evicted and persist()-ed before
+        // we observe the *next* hash. Some iterations may also re-touch
+        // earlier hashes after their actor has gone through persist().
+        for i in 0..32usize {
+            // 64 KiB per iteration — over the 16 KiB inline threshold so
+            // the blob lands as `Complete(Owned)` with an on-disk data
+            // file (the only shape where `TryReference` actually renames).
+            // Salt the first 8 bytes with the iteration index so each
+            // iteration produces a distinct hash.
+            let mut buf = vec![0u8; 64 * 1024];
+            buf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            // Fill the rest with deterministic non-zero bytes (same shape
+            // as `test_data` does for diagnostic readability).
+            for (j, b) in buf.iter_mut().enumerate().skip(8) {
+                *b = 65 + ((j / 1024) % 26) as u8;
+            }
+            let data = bytes::Bytes::from(buf);
+            let hash = Hash::new(&data);
+
+            let _tt = store.add_bytes(data.clone()).temp_tag().await?;
+            store.observe(hash).await_completion().await?;
+
+            let target = testdir.path().join(format!("exported-{i}.bin"));
+            store
+                .blobs()
+                .export_with_opts(ExportOptions {
+                    hash,
+                    mode: ExportMode::TryReference,
+                    target: target.clone(),
+                })
+                .await?;
+            assert!(target.exists(), "TryReference must produce the target file");
+
+            store.sync_db().await?;
+            tokio::task::yield_now().await;
+
+            // Re-observe the same hash; under upstream-buggy persist()
+            // any iteration whose actor got idle-evicted in the window
+            // between the first observe and this one would panic here.
+            store.observe(hash).await_completion().await?;
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_import_bao_ranges() -> TestResult<()> {
         tracing_subscriber::fmt::try_init().ok();
@@ -2308,5 +2431,55 @@ pub mod tests {
                 Some((Ok(chunk), (bytes, offset + chunk_len)))
             }
         })
+    }
+
+    /// Regression cover for the uniclipboard `state_from_open_error` patch.
+    ///
+    /// Sister test to `store::fs::bao_file::persist_regression` — the
+    /// `persist()` patch closed the first source of `Poisoned` state
+    /// (cleanup poisoning a Complete handle); this helper closes the
+    /// second (external data file vanished while metadata still said
+    /// `Complete{External(path)}`). Upstream's unconditional
+    /// `Err(_) => Poisoned` turned every IO failure during load into a
+    /// process-fatal panic at the next `bitfield()` call.
+    mod load_regression {
+        use super::super::state_from_open_error;
+        use super::*;
+
+        /// `NotFound` is the "external path was deleted out from under us"
+        /// case: the blob isn't physically there, but a re-fetch will
+        /// recover it. Falling through to `NonExisting` lets `bitfield()`
+        /// return an empty bitfield and the downloader re-pulls. Under
+        /// the upstream behaviour this would have been `Poisoned`, and
+        /// the next `observe()` would panic at `bao_file.rs:410`.
+        #[test]
+        fn notfound_io_error_maps_to_nonexisting() {
+            let err = io::Error::from(io::ErrorKind::NotFound);
+            let state = state_from_open_error(err);
+            assert!(
+                matches!(state, BaoFileStorage::NonExisting),
+                "NotFound should fall through to NonExisting; got {state:?}"
+            );
+            // The whole point of the patch — `bitfield()` must not panic.
+            let _ = state.bitfield();
+        }
+
+        /// Permission / disk-full / corrupt-metadata failures keep the
+        /// upstream `Poisoned` behaviour. These are real on-disk faults
+        /// that should surface loudly rather than be silently recovered.
+        #[test]
+        fn other_io_errors_keep_upstream_poisoned_behaviour() {
+            for kind in [
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::Other,
+                io::ErrorKind::InvalidData,
+            ] {
+                let state = state_from_open_error(io::Error::from(kind));
+                assert!(
+                    matches!(state, BaoFileStorage::Poisoned),
+                    "{kind:?} should remain Poisoned; got {state:?}"
+                );
+            }
+        }
     }
 }

@@ -2,14 +2,17 @@
 
 This branch (`uniclipboard/0.100.0-patched`) sits on top of upstream
 [`n0-computer/iroh-blobs`](https://github.com/n0-computer/iroh-blobs)
-tag `v0.100.0` and adds two related patches. The
+tag `v0.100.0` and adds three patches. The
 [`UniClipboard/UniClipboard`](https://github.com/UniClipboard/UniClipboard)
 repository pulls this branch in as a git submodule under
 `src-tauri/vendor/iroh-blobs/` and wires it via `[patch.crates-io]`.
 
-Both patches address the same downstream symptom — process-fatal panics
+Patches 1 and 2 address the same downstream symptom — process-fatal panics
 at `bao_file.rs:410` "poisoned storage should not be used" — by closing
 two independent sources of that `BaoFileStorage::Poisoned` state.
+
+Patch 3 exposes a hook on `Downloader` that lets downstream callers abort
+an in-flight download by tearing down the underlying QUIC connection.
 
 ## Patch 1 summary
 
@@ -218,10 +221,65 @@ A more defensive variant would change `BaoFileStorage::take()` to only
 swap when the current variant matches a predicate, but that has a broader
 API impact and is left for upstream to decide.
 
+## Patch 3 summary
+
+`Downloader` in `src/api/downloader.rs` hands every `download(...)`
+request off to an internal actor (`DownloaderActor`) that owns the
+spawned task via a `JoinSet`. Caller-facing future cancellation does
+**not** propagate: `handle_download` (line 101–106) wraps the inner
+`tx.send(DownloadProgressItem::Error(...)).await.ok()` — a closed
+receiver is silently swallowed and the task continues to run against
+the network.
+
+The only reliable way to abort an in-flight download from the outside
+is to tear down the underlying QUIC connection held by the actor's
+`ConnectionPool`. `ConnectionPool::close(id)` already exists
+(`src/util/connection_pool.rs:454`) but is unreachable from outside
+the actor.
+
+This patch:
+
+1. Refactors `Downloader::new_with_opts` to construct the
+   `ConnectionPool` externally and share a clone with both the actor
+   and the `Downloader` struct.
+2. Adds a `Downloader::shutdown_endpoint(id)` method that forwards to
+   `pool.close(id)`.
+
+Downstream (uniclipboard `IrohBlobTransferAdapter`) calls this on
+user-initiated cancel and on receiver-side timeout sweeps so the
+actor's `execute_get` loop returns `Read(Reset)` / `ConnectionLost`
+and unwinds the spawned task.
+
+## Affected upstream code
+
+`src/api/downloader.rs`. See the inline `// UniClipboard patch (P3)`
+comments around `pub struct Downloader`, `DownloaderActor::new_with_pool`,
+`Downloader::new_with_opts`, and `Downloader::shutdown_endpoint` for
+the exact diff hunks.
+
+## Proposed upstream fix
+
+The natural upstream shape is identical to what this vendor copy
+ships: expose the pool handle (or just `shutdown_endpoint`) on
+`Downloader`. The change is additive — the existing `new` /
+`new_with_opts` / `download` / `download_with_opts` signatures are
+unchanged, so any existing call site keeps compiling.
+
+Open question for upstream review: whether to also forward a generic
+"cancel-by-request-id" rather than "cancel-by-endpoint-id", to support
+fan-out scenarios where multiple downloads share the same provider.
+For uniclipboard's one-blob-per-ticket model, endpoint granularity is
+sufficient.
+
 ## Retiring this vendor copy
 
-When upstream merges an equivalent fix, the
-`upstream_buggy_persist_poisons_complete_state` test in
-`src/store/fs/bao_file.rs` will begin to fail (the panic message it expects
-to see will no longer occur). That is the signal to drop this `[patch.crates-io]`
+When upstream merges equivalent fixes:
+
+- For patches 1 / 2: the `upstream_buggy_persist_poisons_complete_state`
+  test in `src/store/fs/bao_file.rs` will begin to fail (the panic
+  message it expects to see will no longer occur).
+- For patch 3: a `Downloader::shutdown_endpoint` (or equivalent) lands
+  in a release we're tracking.
+
+When all three are addressed upstream, drop this `[patch.crates-io]`
 entry and switch back to the published crate.

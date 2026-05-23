@@ -28,6 +28,15 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Downloader {
     client: irpc::Client<SwarmProtocol>,
+    /// UniClipboard patch (P3): expose the underlying `ConnectionPool` so
+    /// callers can shut down a specific endpoint connection mid-download.
+    /// See [`Downloader::shutdown_endpoint`] and `UNICLIPBOARD_PATCH.md`.
+    /// Without this hook, an in-flight `Downloader::download` cannot be
+    /// aborted from the outside: the actor's `JoinSet` owns the task and
+    /// dropping the caller's progress stream is silently swallowed
+    /// (`handle_download` calls `tx.send(...).await.ok()`), so cancel must
+    /// be effected by tearing down the underlying QUIC connection.
+    pool: ConnectionPool,
 }
 
 #[rpc_requests(message = SwarmMsg, alias = "Msg", rpc_feature = "rpc")]
@@ -64,14 +73,14 @@ pub enum DownloadProgressItem {
 }
 
 impl DownloaderActor {
-    fn new_with_opts(
-        store: Store,
-        endpoint: Endpoint,
-        pool_options: crate::util::connection_pool::Options,
-    ) -> Self {
+    /// UniClipboard patch (P3): construct the actor with an externally-owned
+    /// `ConnectionPool` so the parent [`Downloader`] can keep a clone for
+    /// `shutdown_endpoint`. Functionally equivalent to the upstream
+    /// `new_with_opts(store, endpoint, pool_options)` constructor.
+    fn new_with_pool(store: Store, pool: ConnectionPool) -> Self {
         Self {
             store,
-            pool: ConnectionPool::new(endpoint, crate::ALPN, pool_options),
+            pool,
             tasks: JoinSet::new(),
             running: HashSet::new(),
         }
@@ -354,9 +363,37 @@ impl Downloader {
         pool_options: crate::util::connection_pool::Options,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel::<SwarmMsg>(32);
-        let actor = DownloaderActor::new_with_opts(store.clone(), endpoint.clone(), pool_options);
+        // UniClipboard patch (P3): construct the pool externally and share a
+        // clone with both the actor and the `Downloader`, so the latter can
+        // call `pool.close(id)` from `shutdown_endpoint`.
+        let pool = ConnectionPool::new(endpoint.clone(), crate::ALPN, pool_options);
+        let actor = DownloaderActor::new_with_pool(store.clone(), pool.clone());
         n0_future::task::spawn(actor.run(rx));
-        Self { client: tx.into() }
+        Self {
+            client: tx.into(),
+            pool,
+        }
+    }
+
+    /// UniClipboard patch (P3): shut down the QUIC connection to a specific
+    /// endpoint, aborting any in-flight `download` against it.
+    ///
+    /// Why this is needed: [`Downloader::download`] hands the work off to an
+    /// internal actor task held by a `JoinSet`. Dropping the caller's
+    /// progress stream does not cancel that task — `handle_download` calls
+    /// `tx.send(...).await.ok()` so a closed receiver is silently swallowed.
+    /// The only way to make the actor's `execute_get` return is to tear
+    /// down the underlying connection (`Read(Reset)` or `ConnectionLost`).
+    ///
+    /// Best-effort: returns `Ok(())` if the endpoint isn't currently held
+    /// by the pool, returns `Err(ConnectionPoolError::Shutdown)` only when
+    /// the pool itself is gone. Callers should treat the error path as
+    /// "already gone, nothing to do".
+    pub async fn shutdown_endpoint(
+        &self,
+        id: EndpointId,
+    ) -> std::result::Result<(), crate::util::connection_pool::ConnectionPoolError> {
+        self.pool.close(id).await
     }
 
     pub fn download(

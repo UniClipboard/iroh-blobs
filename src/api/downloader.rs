@@ -35,6 +35,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Downloader {
     client: irpc::Client<SwarmProtocol>,
+    pool: ConnectionPool,
 }
 
 #[rpc_requests(message = SwarmMsg, alias = "Msg", rpc_feature = "rpc")]
@@ -76,14 +77,10 @@ pub enum DownloadProgressItem {
 }
 
 impl DownloaderActor {
-    fn new_with_opts(
-        store: Store,
-        endpoint: Endpoint,
-        pool_options: crate::util::connection_pool::Options,
-    ) -> Self {
+    fn new_with_pool(store: Store, pool: ConnectionPool) -> Self {
         Self {
             store,
-            pool: ConnectionPool::new(endpoint, crate::ALPN, pool_options),
+            pool,
             tasks: JoinSet::new(),
             idle_waiters: Vec::new(),
         }
@@ -395,10 +392,18 @@ impl Downloader {
         endpoint: &Endpoint,
         pool_options: crate::util::connection_pool::Options,
     ) -> Self {
+        let pool = ConnectionPool::new(endpoint.clone(), crate::ALPN, pool_options);
         let (tx, rx) = tokio::sync::mpsc::channel::<SwarmMsg>(32);
-        let actor = DownloaderActor::new_with_opts(store.clone(), endpoint.clone(), pool_options);
+        let actor = DownloaderActor::new_with_pool(store.clone(), pool.clone());
         n0_future::task::spawn(actor.run(rx));
-        Self { client: tx.into() }
+        Self { client: tx.into(), pool }
+    }
+
+    pub async fn shutdown_endpoint(
+        &self,
+        id: EndpointId,
+    ) -> std::result::Result<(), crate::util::connection_pool::ConnectionPoolError> {
+        self.pool.close(id).await
     }
 
     pub fn download(

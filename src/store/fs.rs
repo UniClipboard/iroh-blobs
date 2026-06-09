@@ -296,7 +296,7 @@ impl SyncEntityApi for HashContext {
                     match self.global.db.get(self.id).await {
                         Ok(state) => match BaoFileStorage::open(state, self).await {
                             Ok(handle) => handle,
-                            Err(_) => BaoFileStorage::Poisoned,
+                            Err(cause) => state_from_open_error(cause),
                         },
                         Err(_) => BaoFileStorage::Poisoned,
                     }
@@ -991,8 +991,14 @@ impl EntityApi for HashContext {
     async fn persist(&self) {
         self.state.send_if_modified(|guard| {
             let hash = &self.id;
-            let BaoFileStorage::Partial(fs) = guard.take() else {
+            // Only Partial states have anything to flush. Calling `take()` on
+            // a non-Partial state leaves the handle Poisoned for the rest of
+            // its lifetime, which later causes `bitfield()` to panic.
+            if !matches!(&*guard, BaoFileStorage::Partial(_)) {
                 return false;
+            }
+            let BaoFileStorage::Partial(fs) = guard.take() else {
+                unreachable!("variant checked above");
             };
             let path = self.global.options.path.bitfield_path(hash);
             trace!("writing bitfield for hash {} to {}", hash, path.display());
@@ -1113,6 +1119,14 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
     };
     ctx.update_await(state).await?;
     Ok(())
+}
+
+fn state_from_open_error(cause: io::Error) -> BaoFileStorage {
+    if cause.kind() == io::ErrorKind::NotFound {
+        BaoFileStorage::NonExisting
+    } else {
+        BaoFileStorage::Poisoned
+    }
 }
 
 fn chunk_range(leaf: &Leaf) -> ChunkRanges {

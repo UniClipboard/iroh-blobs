@@ -1288,28 +1288,48 @@ async fn export_path_impl(
         }
         MemOrFile::File((source_path, size)) => match mode {
             ExportMode::Copy => {
-                let res = reflink_or_copy_with_progress(&source_path, &target, size, tx).await?;
-                trace!(
-                    "exported {} to {}, {res:?}",
-                    source_path.display(),
-                    target.display()
-                );
-            }
-            ExportMode::TryReference => {
-                if !external.is_empty() {
-                    // the file already exists externally, so we need to copy it.
-                    // if the OS supports reflink, we might as well use that.
+                if source_path == target {
+                    trace!(
+                        "export(Copy): source == target {}, skipping",
+                        target.display()
+                    );
+                } else {
                     let res =
                         reflink_or_copy_with_progress(&source_path, &target, size, tx).await?;
                     trace!(
-                        "exported {} also to {}, {res:?}",
+                        "exported {} to {}, {res:?}",
                         source_path.display(),
                         target.display()
                     );
-                    external.push(target);
-                    external.sort();
-                    external.dedup();
-                    external.truncate(MAX_EXTERNAL_PATHS);
+                }
+            }
+            ExportMode::TryReference => {
+                if !external.is_empty() {
+                    if source_path == target || external.contains(&target) {
+                        // The data is already at the target path (or the
+                        // target is the source). Copying a file to itself
+                        // would truncate the target via File::create before
+                        // any bytes are read, destroying the data.  Skip.
+                        trace!(
+                            "export: target {} already present, skipping copy",
+                            target.display()
+                        );
+                    } else {
+                        // the file already exists externally, so we need to copy it.
+                        // if the OS supports reflink, we might as well use that.
+                        let res =
+                            reflink_or_copy_with_progress(&source_path, &target, size, tx)
+                                .await?;
+                        trace!(
+                            "exported {} also to {}, {res:?}",
+                            source_path.display(),
+                            target.display()
+                        );
+                        external.push(target);
+                        external.sort();
+                        external.dedup();
+                        external.truncate(MAX_EXTERNAL_PATHS);
+                    }
                 } else {
                     // the file was previously owned, so we can just move it.
                     // if that fails with ERR_CROSS, we fall back to copy.
